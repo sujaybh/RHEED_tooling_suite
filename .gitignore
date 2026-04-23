@@ -1,0 +1,18 @@
+*.imm
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Node
+node_modules/
+frontend/dist/
+
+# Database / runtime artifacts
+*.db
+backend/saved_data/
