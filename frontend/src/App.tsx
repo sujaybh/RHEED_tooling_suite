@@ -1,4 +1,13 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react'
+
+function useDebounce<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value)
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay)
+    return () => clearTimeout(t)
+  }, [value, delay])
+  return debounced
+}
 import type { SessionInfo, PixelSelection, AnalysisResult, AnalysisStatus, BlobResult, MultiSessionInfo, MultiAnalysisResult } from './types'
 import { uploadFile, fetchPixel, startAnalysis, pollAnalysisStatus, deleteSession, uploadMultiFiles, startMultiAnalysis, pollMultiAnalysisStatus, deleteMultiSession, exportStripAsSession, saveSingleToLibrary, saveMultiToLibrary, loadFromLibrary } from './api'
 import { useFrameLoader } from './hooks/useFrameLoader'
@@ -103,12 +112,18 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false)
   const [fps, setFps] = useState(10)
   const [contrast, setContrast] = useState(1.0)
+  // contrastCommitted is debounced — only this value drives frame fetches.
+  // The raw contrast value still updates instantly for the slider label.
+  const contrastCommitted = useDebounce(contrast, 150)
 
   // Frame cache lives in refs so mutations don't cause re-renders;
   // cacheVersion is the only state that triggers a redraw.
   const frameCacheRef = useRef<Map<number, HTMLImageElement>>(new Map())
   const loadingSetRef = useRef<Set<number>>(new Set())
   const [cacheVersion, setCacheVersion] = useState(0)
+  // Incremented each time the cache is flushed; in-flight loads that captured
+  // an older generation will self-discard on completion.
+  const generationRef = useRef(0)
 
   const [pixelSelection, setPixelSelection] = useState<PixelSelection | null>(null)
   const [pixelLoading, setPixelLoading] = useState(false)
@@ -431,10 +446,22 @@ export default function App() {
   const { prefetchAround } = useFrameLoader(
     session?.sessionId ?? null,
     session?.nframes ?? 0,
+    contrastCommitted,
+    generationRef,
     frameCacheRef.current,
     loadingSetRef.current,
     onFrameReady,
   )
+
+  // Flush frame cache only when the debounced contrast settles,
+  // not on every slider tick. Bump the generation so any still-in-flight
+  // loads from the previous contrast value discard themselves on arrival.
+  useEffect(() => {
+    generationRef.current += 1
+    frameCacheRef.current.clear()
+    loadingSetRef.current.clear()
+    setCacheVersion((v) => v + 1)
+  }, [contrastCommitted])
 
   // Prefetch whenever frame changes
   useEffect(() => {

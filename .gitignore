@@ -16,3 +16,5 @@ frontend/dist/
 # Database / runtime artifacts
 *.db
 backend/saved_data/
+backend/rheed.log
+backend/session_memmaps/

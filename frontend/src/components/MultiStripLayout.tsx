@@ -1,5 +1,6 @@
 import { useApp } from '../App'
 import MultiPlayer from './MultiPlayer'
+import { fixedStripImmUrl } from '../api'
 
 export default function MultiStripLayout() {
   const {
@@ -115,6 +116,13 @@ export default function MultiStripLayout() {
                 >
                   Analyze →
                 </button>
+                <a
+                  href={fixedStripImmUrl(multiSession.sessionId, i)}
+                  title="Download fixed .imm file"
+                  style={{ textDecoration: 'none' }}
+                >
+                  <button className="strip-open-btn">↓ .imm</button>
+                </a>
               </div>
             ))}
           </div>

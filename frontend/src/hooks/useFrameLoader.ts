@@ -1,4 +1,5 @@
 import { useCallback } from 'react'
+import type { MutableRefObject } from 'react'
 import { frameUrl } from '../api'
 
 const PREFETCH_RADIUS = 3
@@ -11,6 +12,8 @@ const PREFETCH_RADIUS = 3
 export function useFrameLoader(
   sessionId: string | null,
   nframes: number,
+  contrast: number,
+  generationRef: MutableRefObject<number>,
   frameCache: Map<number, HTMLImageElement>,
   loadingSet: Set<number>,
   onFrameReady: (index: number, img: HTMLImageElement) => void,
@@ -23,18 +26,21 @@ export function useFrameLoader(
 
       loadingSet.add(index)
       const img = new Image()
-      img.src = frameUrl(sessionId, index)
+      // Snapshot generation at request time; compare against the live ref at
+      // resolve time to drop loads that belong to a superseded contrast value.
+      const myGeneration = generationRef.current
+      img.src = frameUrl(sessionId, index, contrast)
 
       img.decode()
         .then(() => {
           loadingSet.delete(index)
-          onFrameReady(index, img)
+          if (myGeneration === generationRef.current) onFrameReady(index, img)
         })
         .catch(() => {
           loadingSet.delete(index)
         })
     },
-    [sessionId, nframes, frameCache, loadingSet, onFrameReady],
+    [sessionId, nframes, contrast, generationRef, frameCache, loadingSet, onFrameReady],
   )
 
   const prefetchAround = useCallback(

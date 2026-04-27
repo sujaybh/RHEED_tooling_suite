@@ -19,12 +19,47 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import numpy as np
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s.%(msecs)03d  %(levelname)-7s  %(name)s  %(message)s",
-    datefmt="%H:%M:%S",
-)
+_LOG_FORMAT = "%(asctime)s.%(msecs)03d  %(levelname)-7s  %(name)s  %(message)s"
+_LOG_FILE = Path(__file__).parent / "rheed.log"
+
+
+class _FlushFileHandler(logging.FileHandler):
+    """FileHandler that flushes after every record so crashes don't lose lines."""
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
+
+def _setup_logging():
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    fmt = logging.Formatter(_LOG_FORMAT, datefmt="%H:%M:%S")
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    file_h = _FlushFileHandler(_LOG_FILE, mode="a", encoding="utf-8")
+    file_h.setFormatter(fmt)
+    root.addHandler(file_h)
+
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)  # reduce noise
+
+
+_setup_logging()
 log = logging.getLogger("rheed.api")
+log.info("Logging to %s", _LOG_FILE)
+
+# Memmap backing files for live sessions (one .dat per parsed array).
+# Wiped on startup because any files here belong to dead sessions.
+_MEMMAP_DIR = Path(__file__).parent / "session_memmaps"
+_MEMMAP_DIR.mkdir(exist_ok=True)
+for _stale in _MEMMAP_DIR.glob("*.dat"):
+    try:
+        _stale.unlink()
+        log.info("Removed stale memmap %s", _stale.name)
+    except OSError:
+        pass
 
 from imm_parser import auto_detect_format, parse_imm, frame_to_png_bytes
 from blob_analysis import detect_and_track, _circular_mask, assign_strips
@@ -56,6 +91,7 @@ class RheedSession:
     height: int
     nframes: int
     frames: np.ndarray            # (nframes, H, W) uint16  or  (nframes, H, W, 3) uint32
+    memmap_path: Optional[Path] = None   # set when frames are disk-backed
     analysis_result: Optional[dict] = None
     analysis_status: str = "idle"  # idle | running | complete | error
     analysis_error: Optional[str] = None
@@ -76,6 +112,10 @@ class MultiRheedSession:
     height: int
     nframes: int                   # min frames across all files
     mode: str
+    memmap_paths: list = field(default_factory=list)   # one Path per strip, or [] if in-memory
+    # Concatenated raw per-frame headers for each strip (one bytes obj per strip).
+    # Empty when the session was restored from the library (headers not persisted).
+    strip_headers: list = field(default_factory=list)
     analysis_status: str = "idle"
     analysis_error: Optional[str] = None
     # assignments[fixed_strip_i][frame_n] = original_strip_j
@@ -126,19 +166,42 @@ async def upload(
     height: Optional[int] = Query(default=None),
     mode: Optional[str] = Query(default=None),
 ):
-    raw = await file.read()
+    t_upload = time.perf_counter()
+    log.info("[POST /upload] START  filename=%r  content_type=%s  force=%sx%s  mode=%s",
+             file.filename, file.content_type, width, height, mode)
 
-    # Auto-detect (or use forced dims). Run in executor so we don't block.
+    t0 = time.perf_counter()
+    raw = await file.read()
+    file_mb = len(raw) / 1_048_576
+    log.info("[POST /upload] file.read() done  size=%.1f MB  took=%.3fs",
+             file_mb, time.perf_counter() - t0)
+
     loop = asyncio.get_running_loop()
+    session_id = uuid.uuid4().hex
+    mmap_path = _MEMMAP_DIR / f"{session_id}.dat"
+
+    t0 = time.perf_counter()
+    log.info("[POST /upload] handing off to parse_imm executor (memmap=%s) …", mmap_path.name)
     try:
         frames, fmt = await loop.run_in_executor(
             _executor,
-            lambda: parse_imm(raw, force_width=width, force_height=height, force_mode=mode),
+            lambda: parse_imm(raw, force_width=width, force_height=height,
+                              force_mode=mode, memmap_path=str(mmap_path)),
         )
     except ValueError as e:
+        log.error("[POST /upload] parse_imm FAILED after %.3fs: %s", time.perf_counter() - t0, e)
+        if mmap_path.exists():
+            mmap_path.unlink()
         raise HTTPException(status_code=422, detail=str(e))
 
-    session_id = uuid.uuid4().hex
+    log.info("[POST /upload] parse_imm returned in %.3fs (wall time in executor)",
+             time.perf_counter() - t0)
+
+    array_mb = frames.nbytes / 1_048_576
+    log.info("[POST /upload] memmap array: shape=%s  dtype=%s  size=%.1f MB  (file was %.1f MB)",
+             frames.shape, frames.dtype, array_mb, file_mb)
+
+    t0 = time.perf_counter()
     _sessions[session_id] = RheedSession(
         session_id=session_id,
         filename=file.filename or "unknown.imm",
@@ -147,7 +210,12 @@ async def upload(
         height=fmt["height"],
         nframes=fmt["nframes"],
         frames=frames,
+        memmap_path=mmap_path,
     )
+    log.info("[POST /upload] session stored in %.4fs  session_id=%s", time.perf_counter() - t0, session_id)
+    log.info("[POST /upload] DONE  total=%.3fs  session=%s  %dx%d  %d frames  mode=%s",
+             time.perf_counter() - t_upload, session_id,
+             fmt["width"], fmt["height"], fmt["nframes"], fmt["mode"])
 
     return {
         "session_id": session_id,
@@ -281,33 +349,78 @@ async def multi_upload(files: list[UploadFile] = File(...)):
     if len(files) < 2:
         raise HTTPException(status_code=422, detail="At least 2 files required")
 
+    t_multi = time.perf_counter()
+    log.info("[POST /multi-upload] START  nfiles=%d  filenames=%s",
+             len(files), [f.filename for f in files])
+
     loop = asyncio.get_running_loop()
+    session_id = uuid.uuid4().hex
     frames_list = []
     filenames = []
+    mmap_paths = []
+    headers_list = []   # concatenated raw per-frame headers, one bytes obj per strip
     fmt_ref = None
 
-    for uf in files:
+    for idx, uf in enumerate(files):
+        t_file = time.perf_counter()
+        log.info("[POST /multi-upload] [%d/%d] reading %r …", idx + 1, len(files), uf.filename)
+
+        t0 = time.perf_counter()
         raw = await uf.read()
+        file_mb = len(raw) / 1_048_576
+        log.info("[POST /multi-upload] [%d/%d] file.read() done  size=%.1f MB  took=%.3fs",
+                 idx + 1, len(files), file_mb, time.perf_counter() - t0)
+
+        mmap_path = _MEMMAP_DIR / f"{session_id}_{idx}.dat"
+        t0 = time.perf_counter()
+        log.info("[POST /multi-upload] [%d/%d] handing off to parse_imm executor (memmap=%s) …",
+                 idx + 1, len(files), mmap_path.name)
         try:
             frames, fmt = await loop.run_in_executor(
-                _executor, lambda r=raw: parse_imm(r),
+                _executor, lambda r=raw, p=str(mmap_path): parse_imm(r, memmap_path=p),
+            )
+            # Capture per-frame headers before raw bytes are freed.
+            # 640 B × nframes ≈ 110 KB — trivial to keep in memory.
+            _fhs = fmt["frame_header_size"]
+            _strd = fmt["stride"]
+            headers_list.append(
+                b"".join(raw[i * _strd : i * _strd + _fhs] for i in range(frames.shape[0]))
             )
         except ValueError as e:
+            log.error("[POST /multi-upload] [%d/%d] parse_imm FAILED after %.3fs: %s",
+                      idx + 1, len(files), time.perf_counter() - t0, e)
+            if mmap_path.exists():
+                mmap_path.unlink()
+            for p in mmap_paths:  # clean up already-created memmaps for this upload
+                if p.exists():
+                    p.unlink()
             raise HTTPException(status_code=422, detail=f"{uf.filename}: {e}")
         finally:
-            del raw  # free raw bytes before parsing the next file
+            del raw
+
+        array_mb = frames.nbytes / 1_048_576
+        log.info("[POST /multi-upload] [%d/%d] parse_imm done in %.3fs  shape=%s  array=%.1f MB",
+                 idx + 1, len(files), time.perf_counter() - t0, frames.shape, array_mb)
+
         frames_list.append(frames)
         filenames.append(uf.filename or "unknown.imm")
+        mmap_paths.append(mmap_path)
+
         if fmt_ref is None:
             fmt_ref = fmt
         elif fmt["width"] != fmt_ref["width"] or fmt["height"] != fmt_ref["height"]:
+            for p in mmap_paths:
+                if p.exists():
+                    p.unlink()
             raise HTTPException(
                 status_code=422,
                 detail=f"{uf.filename}: dimensions {fmt['width']}×{fmt['height']} don't match "
                        f"first file {fmt_ref['width']}×{fmt_ref['height']}",
             )
 
-    session_id = uuid.uuid4().hex
+        log.info("[POST /multi-upload] [%d/%d] file done in %.3fs  cumulative=%.3fs",
+                 idx + 1, len(files), time.perf_counter() - t_file, time.perf_counter() - t_multi)
+
     _multi_sessions[session_id] = MultiRheedSession(
         session_id=session_id,
         filenames=filenames,
@@ -316,7 +429,13 @@ async def multi_upload(files: list[UploadFile] = File(...)):
         height=fmt_ref["height"],
         nframes=min(f.shape[0] for f in frames_list),
         mode=fmt_ref["mode"],
+        memmap_paths=mmap_paths,
+        strip_headers=headers_list,
     )
+
+    total_array_mb = sum(f.nbytes for f in frames_list) / 1_048_576
+    log.info("[POST /multi-upload] DONE  total=%.3fs  session=%s  nstrips=%d  total_array=%.1f MB",
+             time.perf_counter() - t_multi, session_id, len(files), total_array_mb)
 
     return {
         "session_id": session_id,
@@ -452,18 +571,79 @@ async def export_strip_as_session(multi_session_id: str, strip_index: int):
     }
 
 
+_FRAME_HEADER_SIZE = {"gray16": 640, "rgb96": 655}
+
+
+@app.get("/api/multi-session/{session_id}/download-imm/{strip_index}")
+async def download_fixed_strip_imm(session_id: str, strip_index: int):
+    """Return the fixed strip as a binary .imm download with original per-frame headers."""
+    if session_id not in _multi_sessions:
+        raise HTTPException(status_code=404, detail="Multi-session not found")
+    sess = _multi_sessions[session_id]
+
+    if sess.assignments is None:
+        raise HTTPException(status_code=400, detail="Analysis not complete")
+    if not (0 <= strip_index < len(sess.assignments)):
+        raise HTTPException(status_code=416, detail="strip_index out of range")
+    if not sess.strip_headers:
+        raise HTTPException(
+            status_code=400,
+            detail="Original frame headers not available for this session. "
+                   "Re-upload the files to enable .imm export.",
+        )
+
+    fhs = _FRAME_HEADER_SIZE[sess.mode]
+
+    def build_imm() -> bytes:
+        parts: list[bytes] = []
+        for n in range(sess.nframes):
+            src = sess.assignments[strip_index][n]
+            hdr = sess.strip_headers[src][n * fhs : (n + 1) * fhs]
+            frame = sess.frames_list[src][n]
+            if sess.mode == "gray16":
+                pixels = frame.astype(np.dtype("<u2")).tobytes()
+            else:  # rgb96: frames stored RGB; .imm format is BGR
+                pixels = frame[:, :, ::-1].astype(np.dtype("<u4")).tobytes()
+            parts.append(hdr)
+            parts.append(pixels)
+        return b"".join(parts)
+
+    loop = asyncio.get_running_loop()
+    imm_bytes = await loop.run_in_executor(_executor, build_imm)
+
+    orig_name = sess.filenames[strip_index] if strip_index < len(sess.filenames) else f"strip_{strip_index + 1}.imm"
+    download_name = f"fixed_{Path(orig_name).stem}.imm"
+
+    import io as _io
+    return StreamingResponse(
+        _io.BytesIO(imm_bytes),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{download_name}"'},
+    )
+
+
 @app.delete("/api/multi-session/{session_id}")
 async def delete_multi_session(session_id: str):
     if session_id not in _multi_sessions:
         raise HTTPException(status_code=404, detail="Multi-session not found")
-    del _multi_sessions[session_id]
+    sess = _multi_sessions.pop(session_id)
+    for p in sess.memmap_paths:
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            pass
     return {"deleted": session_id}
 
 
 @app.delete("/api/session/{session_id}")
 async def delete_session(session_id: str):
-    _get_session(session_id)
+    sess = _get_session(session_id)
     del _sessions[session_id]
+    if sess.memmap_path:
+        try:
+            sess.memmap_path.unlink(missing_ok=True)
+        except OSError:
+            pass
     return {"deleted": session_id}
 
 

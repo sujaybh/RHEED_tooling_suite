@@ -204,6 +204,10 @@ export async function deleteMultiSession(sessionId: string): Promise<void> {
   await fetch(`${BASE}/multi-session/${sessionId}`, { method: 'DELETE' })
 }
 
+export function fixedStripImmUrl(multiSessionId: string, stripIndex: number): string {
+  return `${BASE}/multi-session/${multiSessionId}/download-imm/${stripIndex}`
+}
+
 // ── Library API ────────────────────────────────────────────────────────────────
 
 export async function saveSingleToLibrary(

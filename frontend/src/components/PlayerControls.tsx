@@ -68,13 +68,13 @@ export default function PlayerControls() {
           <input
             type="range"
             className="contrast-slider"
-            min={0.5}
+            min={0.1}
             max={8}
-            step={0.1}
+            step={0.05}
             value={contrast}
             onChange={(e) => setContrast(parseFloat(e.target.value))}
           />
-          <span className="contrast-val">{contrast.toFixed(1)}×</span>
+          <span className="contrast-val">γ {(1 / contrast).toFixed(2)}</span>
         </label>
       </div>
     </div>
