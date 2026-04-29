@@ -15,9 +15,23 @@ Strategy:
 """
 from __future__ import annotations
 
+import logging
+import time
+
 import numpy as np
+import psutil
 from skimage.feature import blob_log
 from typing import Optional
+
+log = logging.getLogger("rheed.blob")
+_proc = psutil.Process()
+
+
+def _mem(label: str) -> None:
+    rss = _proc.memory_info().rss / 1_048_576
+    vm  = psutil.virtual_memory()
+    log.info("[MEM/%s]  RSS=%.0f MB  avail=%.0f MB  used=%.0f%%",
+             label, rss, vm.available / 1_048_576, vm.percent)
 
 # Pre-assigned display colors
 _BEAM_COLORS = ["#ff4444", "#ff8822"]
@@ -163,18 +177,45 @@ def assign_strips(
     K = len(frames_list)
     N = min(f.shape[0] for f in frames_list)
 
+    _WARN_AVAIL = 400   # MB — warn if below this during analysis
+    _MEM_EVERY  = max(1, N // 10)   # memory log every ~10% of frames
+
+    log.info("[assign_strips] START  K=%d strips  N=%d frames", K, N)
+    _mem("assign-start")
+
     # Reference position = beam center in frame 0 of each original strip
     ref_centers = [find_beam_center(frames_list[k][0], beam_roi_fraction) for k in range(K)]
+    _mem("assign-ref-centers-done")
+    log.info("[assign_strips] ref_centers=%s", [(f"{cx:.1f}", f"{cy:.1f}") for cx, cy in ref_centers])
 
     # Frame 0 is always correct (identity assignment)
     assignments: list[list[int]] = [[k] for k in range(K)]  # assignments[i] starts with [i]
 
+    t0 = time.perf_counter()
     for n in range(1, N):
         current_centers = [find_beam_center(frames_list[j][n], beam_roi_fraction) for j in range(K)]
         # assignment_n[j] = i: original strip j at frame n → fixed strip i
         assignment_n = _greedy_assign(current_centers, ref_centers)
         for j, i in enumerate(assignment_n):
             assignments[i].append(j)
+
+        if n % _MEM_EVERY == 0:
+            elapsed = time.perf_counter() - t0
+            vm = psutil.virtual_memory()
+            avail = vm.available / 1_048_576
+            rss   = _proc.memory_info().rss / 1_048_576
+            rate  = n / elapsed if elapsed > 0 else 0
+            log.info("[assign_strips] frame %d/%d (%.0f%%)  %.1fs  %.0f fr/s  "
+                     "avail=%.0f MB  RSS=%.0f MB  used=%.0f%%",
+                     n, N, 100 * n / N, elapsed, rate, avail, rss, vm.percent)
+            if avail < _WARN_AVAIL:
+                log.warning("[assign_strips] *** LOW MEMORY %.0f MB at frame %d/%d ***",
+                            avail, n, N)
+
+    elapsed = time.perf_counter() - t0
+    log.info("[assign_strips] frame loop done  %d frames  %.2fs  %.0f fr/s",
+             N, elapsed, N / elapsed if elapsed > 0 else 0)
+    _mem("assign-frame-loop-done")
 
     # Smooth out isolated wrong frames caused by ambiguous transition-point centroids.
     # Median filter is applied per-strip independently, which can introduce conflicts
@@ -190,6 +231,8 @@ def assign_strips(
                     assignments[i][n] = smoothed[i][n]
             # else: leave assignments[i][n] as the raw greedy value
 
+    _mem("assign-done")
+    log.info("[assign_strips] DONE  K=%d  N=%d", K, N)
     return assignments, ref_centers
 
 

@@ -331,6 +331,48 @@ body {
   text-align: center;
 }
 
+/* ── Chart download bar ─────────────────────────────────────────────────────── */
+.chart-download-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.chart-download-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-right: 2px;
+}
+
+.chart-dl-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: border-color 0.15s, color 0.15s;
+}
+
+.chart-dl-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chart-dl-btn--csv {
+  border-color: #3a4a3a;
+  color: #7aab7a;
+}
+
+.chart-dl-btn--csv:hover {
+  border-color: #7aab7a;
+  color: #a0d0a0;
+}
+
 /* ── Analyze button ─────────────────────────────────────────────────────────── */
 .btn-analyze {
   display: flex;

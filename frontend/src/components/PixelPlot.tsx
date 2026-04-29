@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useApp } from '../App'
+import ChartDownload from './ChartDownload'
 
 import type * as PlotlyType from 'plotly.js-dist-min'
 
@@ -102,7 +103,19 @@ export default function PixelPlot() {
       {pixelLoading ? (
         <div className="panel-placeholder">Loading…</div>
       ) : (
-        <div ref={divRef} style={{ width: '100%' }} />
+        <>
+          <div ref={divRef} style={{ width: '100%' }} />
+          {pixelSelection && (
+            <ChartDownload
+              getDiv={() => divRef.current}
+              getCSV={() => ({
+                headers: ['frame', 'intensity'],
+                rows: pixelSelection.intensities.map((v, i) => [i + 1, v]),
+              })}
+              filename={`pixel_${pixelSelection.x}_${pixelSelection.y}`}
+            />
+          )}
+        </>
       )}
     </div>
   )

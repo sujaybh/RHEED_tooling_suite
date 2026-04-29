@@ -1,0 +1,21 @@
+services:
+  rheed:
+    build: .
+    image: rheed-suite:latest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist session data and the SQLite DB across restarts
+      - ./backend/saved_data:/app/backend/saved_data
+      - ./backend/session_memmaps:/app/backend/session_memmaps
+      - ./backend/rheed_library.db:/app/backend/rheed_library.db
+      # Mount datasets read-only so the app can serve .imm files
+      - ./dataset7:/app/dataset7:ro
+      - ./dataset10:/app/dataset10:ro
+      # Mount the full source tree so Claude Code edits persist on the host
+      - .:/workspace
+      # Mount host Claude Code credentials so you don't need to log in again
+      - ${HOME}/.claude:/root/.claude
+    # Usage: docker compose run --rm rheed bash
+    # Then inside: uvicorn main:app --host 0.0.0.0 --port 8000 &
+    #              cd /workspace && claude --dangerously-skip-permissions

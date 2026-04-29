@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useApp } from '../App'
 import type { BlobResult } from '../types'
+import ChartDownload from './ChartDownload'
 
 import type * as PlotlyType from 'plotly.js-dist-min'
 
@@ -167,5 +168,25 @@ function BlobPlot({ blobs, currentFrame }: { blobs: BlobResult[]; currentFrame: 
     } as Partial<PlotlyType.Layout>)
   }, [currentFrame])
 
-  return <div ref={divRef} style={{ width: '100%' }} />
+  const getCSV = () => {
+    if (!blobs.length) return null
+    const nframes = blobs[0].mean_intensities.length
+    const headers = ['frame', ...blobs.map(b => `blob_${b.blob_id}_${b.region}`)]
+    const rows = Array.from({ length: nframes }, (_, i) => [
+      i + 1,
+      ...blobs.map(b => b.mean_intensities[i]),
+    ])
+    return { headers, rows }
+  }
+
+  return (
+    <>
+      <div ref={divRef} style={{ width: '100%' }} />
+      <ChartDownload
+        getDiv={() => divRef.current}
+        getCSV={getCSV}
+        filename="blob_intensities"
+      />
+    </>
+  )
 }

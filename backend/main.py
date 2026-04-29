@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import psutil
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -60,10 +61,32 @@ for _stale in _MEMMAP_DIR.glob("*.dat"):
         log.info("Removed stale memmap %s", _stale.name)
     except OSError:
         pass
+# Also clean up any leftover temp files from crashed uploads
+for _stale in _MEMMAP_DIR.glob("*.tmp"):
+    try:
+        _stale.unlink()
+        log.info("Removed stale temp file %s", _stale.name)
+    except OSError:
+        pass
 
-from imm_parser import auto_detect_format, parse_imm, frame_to_png_bytes
+from imm_parser import auto_detect_format, parse_imm, parse_imm_from_file, get_raw_headers, frame_to_png_bytes
 from blob_analysis import detect_and_track, _circular_mask, assign_strips
 import database as db
+
+# ── Process-level memory helper ────────────────────────────────────────────────
+
+_proc = psutil.Process()
+
+
+def _rss_mb() -> float:
+    return _proc.memory_info().rss / 1_048_576
+
+
+def _log_mem(label: str) -> None:
+    rss = _rss_mb()
+    vm = psutil.virtual_memory()
+    log.info("[MEM] %-40s  RSS=%.0f MB  sys_avail=%.0f MB  sys_used=%.0f%%",
+             label, rss, vm.available / 1_048_576, vm.percent)
 
 # ── App setup ─────────────────────────────────────────────────────────────────
 
@@ -157,6 +180,30 @@ class AnalyzeParams(BaseModel):
     diff_max_blobs: int = 15
 
 
+# ── Upload helpers ─────────────────────────────────────────────────────────────
+
+_STREAM_CHUNK = 4 * 1024 * 1024  # 4 MB per chunk — keeps peak RAM small
+
+
+async def _stream_to_file(uf: UploadFile, dest_path: Path) -> int:
+    """
+    Stream an UploadFile to disk in 4 MB chunks without ever loading the full
+    file into Python's heap.  Returns total bytes written.
+
+    UploadFile.read(n) reads from Starlette's SpooledTemporaryFile (which for
+    large files is already on disk), so the 4 MB chunk is all that lives in RAM.
+    """
+    total = 0
+    with open(dest_path, 'wb') as f:
+        while True:
+            data = await uf.read(_STREAM_CHUNK)
+            if not data:
+                break
+            f.write(data)
+            total += len(data)
+    return total
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.post("/api/upload")
@@ -167,41 +214,54 @@ async def upload(
     mode: Optional[str] = Query(default=None),
 ):
     t_upload = time.perf_counter()
+    _log_mem("upload START")
     log.info("[POST /upload] START  filename=%r  content_type=%s  force=%sx%s  mode=%s",
              file.filename, file.content_type, width, height, mode)
 
-    t0 = time.perf_counter()
-    raw = await file.read()
-    file_mb = len(raw) / 1_048_576
-    log.info("[POST /upload] file.read() done  size=%.1f MB  took=%.3fs",
-             file_mb, time.perf_counter() - t0)
-
     loop = asyncio.get_running_loop()
     session_id = uuid.uuid4().hex
+    tmp_path  = _MEMMAP_DIR / f"{session_id}.tmp"
     mmap_path = _MEMMAP_DIR / f"{session_id}.dat"
 
+    # ── Step 1: stream upload to temp file (4 MB chunks, not 345 MB in RAM) ──
     t0 = time.perf_counter()
-    log.info("[POST /upload] handing off to parse_imm executor (memmap=%s) …", mmap_path.name)
+    try:
+        file_bytes = await _stream_to_file(file, tmp_path)
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Upload streaming failed: {e}")
+
+    file_mb = file_bytes / 1_048_576
+    log.info("[POST /upload] streamed to tmp  size=%.1f MB  took=%.3fs",
+             file_mb, time.perf_counter() - t0)
+    _log_mem("upload after stream")
+
+    # ── Step 2: parse from temp file (zero Python-heap for pixel data) ────────
+    t0 = time.perf_counter()
+    log.info("[POST /upload] handing off to parse_imm_from_file executor …")
     try:
         frames, fmt = await loop.run_in_executor(
             _executor,
-            lambda: parse_imm(raw, force_width=width, force_height=height,
-                              force_mode=mode, memmap_path=str(mmap_path)),
+            lambda: parse_imm_from_file(
+                str(tmp_path),
+                force_width=width, force_height=height, force_mode=mode,
+                memmap_path=str(mmap_path),
+            ),
         )
     except ValueError as e:
-        log.error("[POST /upload] parse_imm FAILED after %.3fs: %s", time.perf_counter() - t0, e)
-        if mmap_path.exists():
-            mmap_path.unlink()
+        log.error("[POST /upload] parse FAILED after %.3fs: %s", time.perf_counter() - t0, e)
+        mmap_path.unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        tmp_path.unlink(missing_ok=True)  # temp file no longer needed
 
-    log.info("[POST /upload] parse_imm returned in %.3fs (wall time in executor)",
-             time.perf_counter() - t0)
+    log.info("[POST /upload] parse done in %.3fs", time.perf_counter() - t0)
+    _log_mem("upload after parse")
 
     array_mb = frames.nbytes / 1_048_576
-    log.info("[POST /upload] memmap array: shape=%s  dtype=%s  size=%.1f MB  (file was %.1f MB)",
-             frames.shape, frames.dtype, array_mb, file_mb)
+    log.info("[POST /upload] memmap array: shape=%s  dtype=%s  size=%.1f MB",
+             frames.shape, frames.dtype, array_mb)
 
-    t0 = time.perf_counter()
     _sessions[session_id] = RheedSession(
         session_id=session_id,
         filename=file.filename or "unknown.imm",
@@ -212,7 +272,7 @@ async def upload(
         frames=frames,
         memmap_path=mmap_path,
     )
-    log.info("[POST /upload] session stored in %.4fs  session_id=%s", time.perf_counter() - t0, session_id)
+
     log.info("[POST /upload] DONE  total=%.3fs  session=%s  %dx%d  %d frames  mode=%s",
              time.perf_counter() - t_upload, session_id,
              fmt["width"], fmt["height"], fmt["nframes"], fmt["mode"])
@@ -350,68 +410,75 @@ async def multi_upload(files: list[UploadFile] = File(...)):
         raise HTTPException(status_code=422, detail="At least 2 files required")
 
     t_multi = time.perf_counter()
+    _log_mem("multi-upload START")
     log.info("[POST /multi-upload] START  nfiles=%d  filenames=%s",
              len(files), [f.filename for f in files])
 
     loop = asyncio.get_running_loop()
     session_id = uuid.uuid4().hex
-    frames_list = []
-    filenames = []
-    mmap_paths = []
+    frames_list  = []
+    filenames    = []
+    mmap_paths   = []
     headers_list = []   # concatenated raw per-frame headers, one bytes obj per strip
-    fmt_ref = None
+    fmt_ref      = None
 
     for idx, uf in enumerate(files):
         t_file = time.perf_counter()
-        log.info("[POST /multi-upload] [%d/%d] reading %r …", idx + 1, len(files), uf.filename)
+        log.info("[POST /multi-upload] [%d/%d] processing %r …", idx + 1, len(files), uf.filename)
+        _log_mem(f"multi-upload [{idx+1}/{len(files)}] start")
 
+        tmp_path  = _MEMMAP_DIR / f"{session_id}_{idx}.tmp"
+        mmap_path = _MEMMAP_DIR / f"{session_id}_{idx}.dat"
+
+        # ── Stream upload to temp file ────────────────────────────────────────
         t0 = time.perf_counter()
-        raw = await uf.read()
-        file_mb = len(raw) / 1_048_576
-        log.info("[POST /multi-upload] [%d/%d] file.read() done  size=%.1f MB  took=%.3fs",
+        try:
+            file_bytes = await _stream_to_file(uf, tmp_path)
+        except Exception as e:
+            tmp_path.unlink(missing_ok=True)
+            for p in mmap_paths:
+                p.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"Upload streaming failed for {uf.filename}: {e}")
+
+        file_mb = file_bytes / 1_048_576
+        log.info("[POST /multi-upload] [%d/%d] streamed  size=%.1f MB  took=%.3fs",
                  idx + 1, len(files), file_mb, time.perf_counter() - t0)
 
-        mmap_path = _MEMMAP_DIR / f"{session_id}_{idx}.dat"
+        # ── Parse from temp file + extract headers ────────────────────────────
         t0 = time.perf_counter()
-        log.info("[POST /multi-upload] [%d/%d] handing off to parse_imm executor (memmap=%s) …",
-                 idx + 1, len(files), mmap_path.name)
+        log.info("[POST /multi-upload] [%d/%d] parsing from temp file …", idx + 1, len(files))
         try:
-            frames, fmt = await loop.run_in_executor(
-                _executor, lambda r=raw, p=str(mmap_path): parse_imm(r, memmap_path=p),
-            )
-            # Capture per-frame headers before raw bytes are freed.
-            # 640 B × nframes ≈ 110 KB — trivial to keep in memory.
-            _fhs = fmt["frame_header_size"]
-            _strd = fmt["stride"]
-            headers_list.append(
-                b"".join(raw[i * _strd : i * _strd + _fhs] for i in range(frames.shape[0]))
-            )
+            def _parse_and_headers(tp=str(tmp_path), mp=str(mmap_path)):
+                frames, fmt = parse_imm_from_file(tp, memmap_path=mp)
+                hdrs = get_raw_headers(tp, fmt)
+                return frames, fmt, hdrs
+
+            frames, fmt, hdrs = await loop.run_in_executor(_executor, _parse_and_headers)
+
         except ValueError as e:
-            log.error("[POST /multi-upload] [%d/%d] parse_imm FAILED after %.3fs: %s",
-                      idx + 1, len(files), time.perf_counter() - t0, e)
-            if mmap_path.exists():
-                mmap_path.unlink()
-            for p in mmap_paths:  # clean up already-created memmaps for this upload
-                if p.exists():
-                    p.unlink()
+            log.error("[POST /multi-upload] [%d/%d] parse FAILED: %s", idx + 1, len(files), e)
+            mmap_path.unlink(missing_ok=True)
+            for p in mmap_paths:
+                p.unlink(missing_ok=True)
             raise HTTPException(status_code=422, detail=f"{uf.filename}: {e}")
         finally:
-            del raw
+            tmp_path.unlink(missing_ok=True)  # temp file no longer needed
 
         array_mb = frames.nbytes / 1_048_576
-        log.info("[POST /multi-upload] [%d/%d] parse_imm done in %.3fs  shape=%s  array=%.1f MB",
+        log.info("[POST /multi-upload] [%d/%d] parse done in %.3fs  shape=%s  array=%.1f MB",
                  idx + 1, len(files), time.perf_counter() - t0, frames.shape, array_mb)
+        _log_mem(f"multi-upload [{idx+1}/{len(files)}] after parse")
 
         frames_list.append(frames)
         filenames.append(uf.filename or "unknown.imm")
         mmap_paths.append(mmap_path)
+        headers_list.append(hdrs)
 
         if fmt_ref is None:
             fmt_ref = fmt
         elif fmt["width"] != fmt_ref["width"] or fmt["height"] != fmt_ref["height"]:
             for p in mmap_paths:
-                if p.exists():
-                    p.unlink()
+                p.unlink(missing_ok=True)
             raise HTTPException(
                 status_code=422,
                 detail=f"{uf.filename}: dimensions {fmt['width']}×{fmt['height']} don't match "
@@ -434,6 +501,7 @@ async def multi_upload(files: list[UploadFile] = File(...)):
     )
 
     total_array_mb = sum(f.nbytes for f in frames_list) / 1_048_576
+    _log_mem("multi-upload DONE")
     log.info("[POST /multi-upload] DONE  total=%.3fs  session=%s  nstrips=%d  total_array=%.1f MB",
              time.perf_counter() - t_multi, session_id, len(files), total_array_mb)
 
@@ -465,6 +533,7 @@ async def start_multi_analyze(session_id: str):
     loop = asyncio.get_running_loop()
 
     async def _run():
+        _log_mem("multi-analyze START")
         try:
             assignments, ref_centers = await loop.run_in_executor(
                 _executor,
@@ -473,9 +542,11 @@ async def start_multi_analyze(session_id: str):
             sess.assignments = assignments
             sess.reference_centers = [{"x": cx, "y": cy} for cx, cy in ref_centers]
             sess.analysis_status = "complete"
+            _log_mem("multi-analyze DONE")
         except Exception as e:
             sess.analysis_status = "error"
             sess.analysis_error = str(e)
+            log.error("[multi-analyze] error: %s", e, exc_info=True)
 
     sess._analysis_task = asyncio.create_task(_run())
     return {"status": "running", "session_id": session_id}
@@ -541,16 +612,31 @@ async def export_strip_as_session(multi_session_id: str, strip_index: int):
     if not (0 <= strip_index < len(msess.assignments)):
         raise HTTPException(status_code=416, detail="strip_index out of range")
 
+    session_id = uuid.uuid4().hex
+    mmap_path  = _MEMMAP_DIR / f"{session_id}.dat"
+    nframes    = msess.nframes
+    h, w       = msess.height, msess.width
+
+    _log_mem(f"export strip {strip_index} START")
+
     def build_frames():
-        return np.stack([
-            msess.frames_list[msess.assignments[strip_index][n]][n]
-            for n in range(msess.nframes)
-        ])
+        # Write directly to a disk-backed memmap — no in-memory np.stack() allocation
+        out = np.memmap(str(mmap_path), dtype=np.uint16, mode='w+', shape=(nframes, h, w))
+        for n in range(nframes):
+            src_strip = msess.assignments[strip_index][n]
+            out[n] = msess.frames_list[src_strip][n]
+        out.flush()
+        return out
 
     loop = asyncio.get_running_loop()
-    frames = await loop.run_in_executor(_executor, build_frames)
+    try:
+        frames = await loop.run_in_executor(_executor, build_frames)
+    except Exception as e:
+        mmap_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Export failed: {e}")
 
-    session_id = uuid.uuid4().hex
+    _log_mem(f"export strip {strip_index} DONE")
+
     filename = msess.filenames[strip_index] if strip_index < len(msess.filenames) else f"strip_{strip_index + 1}.imm"
     _sessions[session_id] = RheedSession(
         session_id=session_id,
@@ -558,8 +644,9 @@ async def export_strip_as_session(multi_session_id: str, strip_index: int):
         mode=msess.mode,
         width=msess.width,
         height=msess.height,
-        nframes=msess.nframes,
+        nframes=nframes,
         frames=frames,
+        memmap_path=mmap_path,
     )
     return {
         "session_id": session_id,
@@ -567,7 +654,7 @@ async def export_strip_as_session(multi_session_id: str, strip_index: int):
         "mode": msess.mode,
         "width": msess.width,
         "height": msess.height,
-        "nframes": msess.nframes,
+        "nframes": nframes,
     }
 
 
@@ -691,23 +778,17 @@ async def save_single(req: SaveSingleRequest):
     analysis_meta_dict = req.analysis_meta.model_dump() if req.analysis_meta else {}
     blobs_list = [b.model_dump() for b in req.blobs] if req.blobs else []
 
-    log.info("[POST /save/single] serialised %d blobs, handing off to executor …", len(blobs_list))
-
     loop = asyncio.get_running_loop()
     replace_id = req.replace_instance_id
 
     def _save():
-        log.info("[_save/single] executor thread started")
         if replace_id:
-            log.info("[_save/single] deleting old instance %s …", replace_id)
             db.delete_instance(replace_id)
-        result = db.save_single_instance(
+        return db.save_single_instance(
             name, sess.filename, sess.mode,
             sess.width, sess.height, sess.nframes,
             sess.frames, analysis_meta_dict, blobs_list,
         )
-        log.info("[_save/single] executor thread done")
-        return result
 
     inst_id = await loop.run_in_executor(_executor, _save)
     log.info("[POST /save/single] returning 201  inst_id=%s  total=%.2fs", inst_id, time.perf_counter() - t0)
@@ -730,21 +811,17 @@ async def save_multi(req: SaveMultiRequest):
 
     loop = asyncio.get_running_loop()
     frames_list = msess.frames_list
-    filenames = msess.filenames
-    replace_id = req.replace_instance_id
+    filenames   = msess.filenames
+    replace_id  = req.replace_instance_id
 
     def _save():
-        log.info("[_save/multi] executor thread started")
         if replace_id:
-            log.info("[_save/multi] deleting old instance %s …", replace_id)
             db.delete_instance(replace_id)
-        result = db.save_multi_instance(
+        return db.save_multi_instance(
             name, filenames, frames_list, msess.mode,
             msess.width, msess.height, msess.nframes,
             msess.assignments, msess.reference_centers,
         )
-        log.info("[_save/multi] executor thread done")
-        return result
 
     inst_id = await loop.run_in_executor(_executor, _save)
     log.info("[POST /save/multi] returning 201  inst_id=%s  total=%.2fs", inst_id, time.perf_counter() - t0)
